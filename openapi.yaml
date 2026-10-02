@@ -1,0 +1,195 @@
+openapi: 3.0.3
+info:
+  title: Acme Inventory API
+  version: 1.2.3
+  description: |
+    Stock level and reservation service for the Acme commerce platform. Owns
+    authoritative SKU stock counts and hands out time-limited reservations so
+    checkout can hold stock while payment is authorised.
+
+    ## Service dependencies
+
+    **This service calls:**
+
+    | Target service | Operation | Purpose |
+    |---|---|---|
+    | Acme Warehouse Service (`acme-warehouse-api`) | `POST /v1/stock-sync` | Pull physical counts from WMS |
+    | Slack *(external)* | `POST /services/T000/B000/XXXX` | Alert on low-stock threshold breach |
+
+    **Services that call this service:**
+
+    - `acme-orders-api` — `POST /v1/reservations` (checkout hold),
+      `DELETE /v1/reservations/{reservationId}` (release on cancellation)
+
+    ## Data stores
+
+    - **PostgreSQL** `acme_inventory` — tables `skus`, `stock_levels`, `reservations`
+    - **Redis** — reservation TTL keys (`reservation:{id}`), 15-minute expiry
+
+    ## Notes for dependency analysis
+
+    Reservations expire after 15 minutes via a Redis TTL. If the expiry sweeper
+    fails, stock leaks as permanently held — the reconciliation job
+    (`reservations:reconcile`, every 10 minutes) is the safety net.
+
+    `POST /reservations` is called synchronously inside `POST /orders`, so its
+    p99 latency is on the critical path for every checkout in the platform.
+  contact:
+    name: Acme Supply Chain Team
+    email: supply-chain@acme.example
+servers:
+  - url: https://inventory.internal.acme.example/v1
+    description: Cluster-internal endpoint (service mesh)
+tags:
+  - name: stock
+    description: Stock level queries
+  - name: reservations
+    description: Time-limited stock holds
+paths:
+  /stock/{sku}:
+    get:
+      operationId: getStockLevel
+      summary: Get the stock level for a SKU
+      tags: [stock]
+      parameters:
+        - $ref: '#/components/parameters/Sku'
+      responses:
+        '200':
+          description: Current stock level
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/StockLevel'
+        '404':
+          description: Unknown SKU
+  /reservations:
+    post:
+      operationId: createReservation
+      summary: Reserve stock for a pending order
+      description: |
+        Places a 15-minute hold on the requested quantity. Returns `409` if
+        available stock is insufficient — callers treat this as a failed
+        checkout, not a retryable error.
+      tags: [reservations]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateReservationRequest'
+      responses:
+        '201':
+          description: Stock reserved
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Reservation'
+        '409':
+          description: Insufficient available stock
+  /reservations/{reservationId}:
+    get:
+      operationId: getReservation
+      summary: Fetch a reservation
+      tags: [reservations]
+      parameters:
+        - $ref: '#/components/parameters/ReservationId'
+      responses:
+        '200':
+          description: The reservation
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Reservation'
+        '404':
+          description: Reservation not found or already expired
+    delete:
+      operationId: releaseReservation
+      summary: Release a reservation
+      description: |
+        Returns held stock to the available pool. Called by `acme-orders-api`
+        when an order is cancelled. Idempotent — releasing an already-expired
+        reservation returns `204`.
+      tags: [reservations]
+      parameters:
+        - $ref: '#/components/parameters/ReservationId'
+      responses:
+        '204':
+          description: Released (or already expired)
+  /reservations/{reservationId}/commit:
+    post:
+      operationId: commitReservation
+      summary: Commit a reservation into a permanent stock decrement
+      tags: [reservations]
+      parameters:
+        - $ref: '#/components/parameters/ReservationId'
+      responses:
+        '200':
+          description: Reservation committed
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Reservation'
+        '409':
+          description: Reservation expired before commit
+components:
+  parameters:
+    Sku:
+      name: sku
+      in: path
+      required: true
+      schema:
+        type: string
+    ReservationId:
+      name: reservationId
+      in: path
+      required: true
+      schema:
+        type: string
+        format: uuid
+  schemas:
+    StockLevel:
+      type: object
+      properties:
+        sku:
+          type: string
+        onHand:
+          type: integer
+        reserved:
+          type: integer
+        available:
+          type: integer
+          description: '`onHand - reserved` — the number checkout can actually sell'
+        warehouseId:
+          type: string
+    CreateReservationRequest:
+      type: object
+      required: [sku, quantity, orderId]
+      properties:
+        sku:
+          type: string
+        quantity:
+          type: integer
+          minimum: 1
+        orderId:
+          type: string
+          format: uuid
+          description: The order this hold belongs to (correlation key)
+    Reservation:
+      type: object
+      properties:
+        id:
+          type: string
+          format: uuid
+        sku:
+          type: string
+        quantity:
+          type: integer
+        orderId:
+          type: string
+          format: uuid
+        status:
+          type: string
+          enum: [held, committed, released, expired]
+        expiresAt:
+          type: string
+          format: date-time
