@@ -1,0 +1,16 @@
+# Node
+node_modules/
+dist/
+build/
+*.log
+
+# Env
+.env
+.env.local
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Postman CLI local state (the manifest itself IS committed)
+.postman/*.local
